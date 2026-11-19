@@ -964,6 +964,22 @@ concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 # off the queue that wait for a free slot / GPU room: they go before anything
 # still queued. Durations are a rolling sample of this instance's finished jobs.
 _admitting: set = set()
+# Self-host project manager (see /api/local/projects): main.py processes by
+# job, and the jobs cancelled from the dashboard (the dispatcher skips them).
+_job_processes: Dict[str, subprocess.Popen] = {}
+_cancelled_jobs: set = set()
+CANCELLED_LOG = "🛑 Cancelled by you."
+
+
+def _kill_job_process(process):
+    """Kill a main.py child and everything it started (its own session)."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
 _recent_job_seconds: list = []
 DEFAULT_JOB_SECONDS = 240
 
@@ -2567,6 +2583,8 @@ def _expired_marker(job_id):
 
 
 def _expired_log(marker_text) -> str:
+    if str(marker_text).startswith("cancelled"):
+        return CANCELLED_LOG
     return QUEUE_EXPIRED_RAN_LOG if str(marker_text).startswith("ran") else QUEUE_EXPIRED_LOG
 
 
@@ -3180,6 +3198,11 @@ async def process_queue():
             _priority, _seq, job_id = await job_queue.get()
             _queue_changed()
 
+            if job_id in _cancelled_jobs:
+                # Cancelled (or deleted) from the dashboard while it waited.
+                job_queue.task_done()
+                continue
+
             if _draining:
                 # Leave it on disk for the next instance (manifest, no heartbeat).
                 print(f"⏸️ Draining — leaving {job_id} for the next instance.")
@@ -3550,6 +3573,8 @@ def is_transient_failure(logs) -> bool:
 
 
 def _should_auto_retry(job) -> bool:
+    if job and job.get('cancelled'):
+        return False
     # A run on the remote worker that did not complete is always run again
     # here, whatever it printed: this host decides what a video's failure is.
     if not (job and job.get('status') == 'failed' and not _draining and job.get('cmd')):
@@ -5023,6 +5048,8 @@ def _finish_job(job_id, returncode, output_dir):
         else:
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['logs'].append("No metadata file generated.")
+    elif jobs[job_id].get('cancelled'):
+        jobs[job_id]['status'] = 'failed'
     else:
         jobs[job_id]['status'] = 'failed'
         jobs[job_id]['logs'].append(_scrub_secrets(f"Process failed with exit code {returncode}"))
@@ -5050,7 +5077,11 @@ async def _run_main(job_id, cmd, env, tick=None):
         env=env,
         cwd=os.getcwd(),
         preexec_fn=(_lower_priority if nice and launch[0] != "nice" else None),
+        # Own process group: a cancel kills main.py and its ffmpeg/yt-dlp
+        # children together (_kill_job_process).
+        start_new_session=True,
     )
+    _job_processes[job_id] = process
     # We need to capture logs in a thread because Popen isn't async
     t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
     t_log.daemon = True
@@ -5061,10 +5092,8 @@ async def _run_main(job_id, cmd, env, tick=None):
         try:
             await asyncio.sleep(2)
         except asyncio.CancelledError:
-            try:
-                process.kill()
-            except Exception:
-                pass
+            _kill_job_process(process)
+            _job_processes.pop(job_id, None)
             raise
         if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
             _touch_manifest(job_id)
@@ -5074,6 +5103,7 @@ async def _run_main(job_id, cmd, env, tick=None):
     # The exit code can be read before the reader thread saw the last lines
     # (SOURCE_READY is printed right before the exit).
     await asyncio.to_thread(t_log.join, 5)
+    _job_processes.pop(job_id, None)
     return process.returncode
 
 
@@ -6434,6 +6464,263 @@ async def get_status(job_id: str, request: Request):
         # offer), so the dashboard can say so next to the clips.
         "partial": job.get('partial'),
     }
+
+
+# --- Self-host project manager: list, cancel, delete --------------------------
+# The History tab is Cloud only (R2 library); on self-host every job lives in
+# OUTPUT_DIR until JOB_RETENTION_SECONDS and the dashboard only knew the one in
+# its saved session. These list them all, stop one (queued or running) and
+# delete its files. Off with billing on: a cancel there has to settle minutes.
+_JOB_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_SOURCE_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v")
+
+
+def _self_host_job_id(job_id: str) -> str:
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not _JOB_ID_RE.match(job_id or ""):
+        raise HTTPException(status_code=400, detail="Bad job id.")
+    return job_id
+
+
+def _job_cmd(job_id, job=None):
+    """The job's main.py command: from memory, else its (cancelled) manifest."""
+    cmd = (job or {}).get('cmd')
+    if cmd:
+        return cmd
+    for name in (_RESUME_FILE, _RESUME_FILE + ".cancelled"):
+        try:
+            with open(os.path.join(OUTPUT_DIR, job_id, name)) as f:
+                cmd = json.load(f).get('cmd')
+            if cmd:
+                return cmd
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _cmd_arg(cmd, flag):
+    """Value of a main.py flag (the python "-u" before main.py is skipped)."""
+    if not cmd or "main.py" not in cmd:
+        return None
+    args = cmd[cmd.index("main.py") + 1:]
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+def _job_upload_path(cmd):
+    """The uploaded source of a job, only when it sits inside UPLOAD_DIR."""
+    path = _cmd_arg(cmd, "-i")
+    if not path:
+        return None
+    try:
+        root = os.path.realpath(UPLOAD_DIR)
+        real = os.path.realpath(path)
+        if os.path.commonpath([root, real]) == root and real != root:
+            return real
+    except ValueError:
+        pass
+    return None
+
+
+def _marker_text(job_id):
+    try:
+        with open(os.path.join(OUTPUT_DIR, job_id, _EXPIRED_MARKER)) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _project_summary(job_id):
+    path = os.path.join(OUTPUT_DIR, job_id)
+    try:
+        entries = list(os.scandir(path))
+    except OSError:
+        return None
+    job = jobs.get(job_id)
+    cmd = _job_cmd(job_id, job)
+    names = [e.name for e in entries]
+    size = 0
+    for e in entries:
+        try:
+            if e.is_file(follow_symlinks=False):
+                size += e.stat(follow_symlinks=False).st_size
+        except OSError:
+            pass
+
+    title = None
+    meta = sorted(n for n in names if n.endswith("_metadata.json"))
+    if meta:
+        title = meta[0][:-len("_metadata.json")]
+    else:
+        partial_exts = _SOURCE_EXTS + tuple(x + ".part" for x in _SOURCE_EXTS)
+        sources = sorted(n for n in names
+                         if n.lower().endswith(partial_exts)
+                         and "_clip_" not in n and not n.startswith((".", "temp_", "wm_")))
+        if sources:
+            title = re.sub(r"(\.f\d+)?\.(mp4|mkv|webm|mov|m4v)(\.part)?$", "", sources[0], flags=re.I)
+    source = _cmd_arg(cmd, "-u") or (os.path.basename(_cmd_arg(cmd, "-i") or "") or None)
+    if title:
+        title = title.replace("_", " ").strip()
+
+    marker = _marker_text(job_id)
+    cancelled = (job_id in _cancelled_jobs or bool(job and job.get('cancelled'))
+                 or (marker or "").startswith("cancelled"))
+    if cancelled:
+        status = 'cancelled'
+    elif job is not None:
+        status = _presented_status(job_id, job)
+    elif marker is not None:
+        status = 'failed'
+    elif meta:
+        status = 'completed'
+    elif _RESUME_FILE in names:
+        status = 'queued'
+    else:
+        status = 'failed'
+
+    clips = None
+    result = (job or {}).get('result')
+    if isinstance(result, dict) and isinstance(result.get('clips'), list):
+        clips = len(result['clips'])
+    elif status == 'completed':
+        clips = len([n for n in names if "_clip_" in n and n.endswith(".mp4")
+                     and not n.startswith(("temp_", "wm_", "hooked_"))])
+
+    created = (job or {}).get('submitted_at')
+    try:
+        st = os.stat(path)
+        updated = st.st_mtime
+        created = created or st.st_ctime
+    except OSError:
+        updated = created
+    return {
+        "job_id": job_id,
+        "title": title or source or job_id[:8],
+        "source": source,
+        "status": status,
+        "clips": clips,
+        "size_bytes": size,
+        "created_at": created,
+        "updated_at": updated,
+        "queue": queue_snapshot(job_id) if status == 'queued' else None,
+    }
+
+
+@app.get("/api/local/projects")
+async def list_local_projects():
+    """Every job on this server's disk, newest first (self-host only)."""
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        names = [n for n in os.listdir(OUTPUT_DIR)
+                 if _JOB_ID_RE.match(n) and os.path.isdir(os.path.join(OUTPUT_DIR, n))]
+    except OSError:
+        names = []
+    projects = [p for p in (_project_summary(n) for n in names) if p]
+    projects.sort(key=lambda p: p.get("created_at") or 0, reverse=True)
+    return {"projects": projects}
+
+
+def _cancel_job(job_id) -> bool:
+    """Stop a queued or running job for good: the dispatcher skips it, no
+    auto-retry, and a restart does not resume it (manifest set aside, marker
+    left for _job_view_from_disk). Returns whether anything was stopped."""
+    job = jobs.get(job_id)
+    path = os.path.join(OUTPUT_DIR, job_id)
+    active = bool(job and job.get('status') in ('queued', 'processing'))
+    _cancelled_jobs.add(job_id)
+    if os.path.isdir(path):
+        try:
+            with open(os.path.join(path, _EXPIRED_MARKER), "w") as f:
+                f.write("cancelled")
+        except OSError:
+            pass
+        manifest = os.path.join(path, _RESUME_FILE)
+        if os.path.exists(manifest):
+            active = True
+            try:
+                os.replace(manifest, manifest + ".cancelled")
+            except OSError:
+                pass
+    process = _job_processes.get(job_id)
+    if process is not None and process.poll() is None:
+        _kill_job_process(process)
+        active = True
+    if job is not None and not job.get('cancelled'):
+        job['cancelled'] = True
+        if job.get('status') in ('queued', 'processing'):
+            job['status'] = 'failed'
+        job['logs'].append(CANCELLED_LOG)
+    _admitting.discard(job_id)
+    _queue_changed()
+    return active
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, request: Request):
+    _self_host_job_id(job_id)
+    job = jobs.get(job_id)
+    if job is None and not os.path.isdir(os.path.join(OUTPUT_DIR, job_id)):
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job is not None:
+        await _assert_job_owner(request, job)
+    stopped = _cancel_job(job_id)
+    print(f"🛑 Job {job_id} cancelled from the dashboard (was active: {stopped}).")
+    return {"cancelled": True, "was_active": stopped}
+
+
+def _remove_job_files(path, upload):
+    freed = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                freed += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+    if upload and os.path.isfile(upload):
+        try:
+            freed += os.path.getsize(upload)
+            os.remove(upload)
+        except OSError:
+            pass
+    return freed
+
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: str, request: Request):
+    """Cancel the job if it still runs, then delete its folder (clips, source
+    download, transcript) and its uploaded source."""
+    _self_host_job_id(job_id)
+    path = os.path.join(OUTPUT_DIR, job_id)
+    job = jobs.get(job_id)
+    if job is None and not os.path.isdir(path):
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job is not None:
+        await _assert_job_owner(request, job)
+    cmd = _job_cmd(job_id, job)
+    _cancel_job(job_id)
+    # Let the killed run wind down so nothing writes into the folder after it
+    # is gone.
+    for _ in range(60):
+        if job_id not in _running_jobs and job_id not in _delivering_jobs:
+            break
+        await asyncio.sleep(0.5)
+    upload = _job_upload_path(cmd)
+    if upload:
+        # Another job may clip the same uploaded file.
+        for other_id, other in list(jobs.items()):
+            if other_id != job_id and _job_upload_path(other.get('cmd')) == upload:
+                upload = None
+                break
+    freed = await asyncio.to_thread(_remove_job_files, path, upload)
+    jobs.pop(job_id, None)
+    print(f"🗑️ Job {job_id} deleted from the dashboard ({freed / 1e9:.2f} GB freed).")
+    return {"deleted": True, "freed_bytes": freed}
 
 
 def _locate_source(job_id: str):

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket } from 'lucide-react';
+import { Upload, Sparkles, Youtube, Instagram, Share2, ChevronDown, Check, Activity, LayoutDashboard, Settings, Plus, History, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Calendar, AlertTriangle, KeyRound, Bot, Users, Smartphone, ExternalLink, Copy, CheckCircle2, Mail, Loader2, Download, Menu, Lock, Rocket, FolderOpen, Square } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
@@ -26,6 +26,7 @@ import LoginModal from './components/LoginModal';
 import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import HistoryTab from './components/HistoryTab';
+import ProjectsTab from './components/ProjectsTab';
 import AutopilotTab from './components/AutopilotTab';
 import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
@@ -682,6 +683,43 @@ function App() {
     });
   };
 
+  // Self-host Projects tab: show a job that is still on this server's disk
+  // (running, queued, finished or failed) in the Clip Generator.
+  const openLocalProject = async (projectJobId) => {
+    const data = await apiJson(`/api/status/${projectJobId}`);
+    flushClipState();
+    setJobGone(false);
+    setProjectState(null);
+    setNoSource(false);
+    setPartialJob(data.partial || null);
+    setQualityGate(null);
+    setJobError('');
+    setJobId(projectJobId);
+    setResults(data.result || null);
+    setLogs(data.logs || []);
+    setLogTimes(data.log_times || []);
+    setQueueInfo(data.status === 'queued' && data.queue ? data.queue : null);
+    setProcessingMedia({ type: 'server', payload: `/api/source/${projectJobId}` });
+    if (data.status === 'completed') setStatus('complete');
+    else if (data.status === 'failed') {
+      const last = data.logs && data.logs.length ? data.logs[data.logs.length - 1] : 'Process failed';
+      setJobError(readableError(last));
+      setStatus('error');
+    } else setStatus('processing');
+    setActiveTab('dashboard');
+  };
+
+  // Self-host: stop the job on screen (queued or running).
+  const [cancellingJob, setCancellingJob] = useState(false);
+  const cancelCurrentJob = async () => {
+    if (!jobId || cancellingJob) return;
+    setCancellingJob(true);
+    try {
+      await apiFetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+    } catch { /* the poll shows the outcome */ }
+    setCancellingJob(false);
+  };
+
   // Apply one subtitle style to every clip of the job, sequentially.
   const handleBulkSubtitles = async (options) => {
     const clips = results?.clips || [];
@@ -1079,7 +1117,7 @@ function App() {
   // dropped so a reload does not keep forcing the tab.
   const [autopilotConnected, setAutopilotConnected] = useState(null); // connect outcome, see lib/connectReturn.js
   useEffect(() => {
-    const DEEP_LINK_TABS = ['autopilot', 'history', 'settings', 'thumbnails', 'dashboard', 'saasshorts'];
+    const DEEP_LINK_TABS = ['autopilot', 'history', 'projects', 'settings', 'thumbnails', 'dashboard', 'saasshorts'];
     const apply = () => {
       const hash = window.location.hash || '';
       if (!hash.startsWith('#app?')) return;
@@ -1446,6 +1484,7 @@ function App() {
     { id: 'ugc-gallery', ord: '05', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '06', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
     ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '07', icon: History, label: 'History', short: 'history' }] : []),
+    ...(!billingEnabled ? [{ id: 'projects', ord: '07', icon: FolderOpen, label: 'Projects', short: 'projects' }] : []),
     { id: 'settings', ord: '08', icon: Settings, label: 'Settings', short: 'settings' },
   ];
   const activeNav = navItems.find((n) => n.id === activeTab);
@@ -2229,6 +2268,15 @@ function App() {
             </div>
           )}
 
+          {/* View: Projects (self-host: every job on this server's disk) */}
+          {activeTab === 'projects' && !billingEnabled && (
+            <ProjectsTab
+              currentJobId={jobId}
+              onOpenProject={openLocalProject}
+              onProjectGone={handleReset}
+            />
+          )}
+
           {activeTab === 'thumbnails' && (
             <ThumbnailStudio
               geminiApiKey={apiKey}
@@ -2304,12 +2352,24 @@ function App() {
                     <Activity className={`text-brass ${status === 'processing' ? 'animate-pulse' : ''}`} size={18} />
                     Live Analysis
                   </h2>
-                  <span className={status === 'processing' ? 'badge-brass' :
-                    status === 'complete' ? 'badge-ok' :
-                      'badge-danger'
-                    }>
-                    {status.toUpperCase()}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    {status === 'processing' && !billingEnabled && jobId && (
+                      <button
+                        onClick={cancelCurrentJob}
+                        disabled={cancellingJob}
+                        className="btn-ghost px-2.5 py-1 text-xs"
+                        title="Stop this video. Delete its files from the Projects tab."
+                      >
+                        {cancellingJob ? <Loader2 size={12} className="animate-spin" /> : <Square size={12} />} cancel
+                      </button>
+                    )}
+                    <span className={status === 'processing' ? 'badge-brass' :
+                      status === 'complete' ? 'badge-ok' :
+                        'badge-danger'
+                      }>
+                      {status.toUpperCase()}
+                    </span>
+                  </div>
                 </div>
 
                 {/* Trimmed run: say it while it renders, not only once the
