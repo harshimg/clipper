@@ -5,6 +5,10 @@ FROM python:3.11-slim@sha256:65bd3d9f1d7fa268dd1909973ba7eb4bdf41f6dcf2cfbe76ba9
 
 WORKDIR /app
 
+# Ride out slow or flaky links during the multi-GB wheel download instead of
+# failing with "from versions: none" on whichever package times out.
+ENV PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=10
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -102,11 +106,22 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 COPY --from=denoland/deno:bin@sha256:b507583d3c68ba69f3ed2ce5969ae5b8b70f43421c781279c7aea06435263543 /deno /usr/local/bin/deno
 
 # Helper token provider, baked in as a local Node script (no separate service).
-RUN git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider /opt/bgutil-provider \
+# Its `canvas` dependency compiles from source when no prebuilt binary is
+# fetched, so the cairo/pango toolchain is installed for this step only and
+# purged afterwards; the runtime libraries it links against stay.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libjpeg62-turbo libgif7 librsvg2-2 \
+    && apt-mark manual libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libjpeg62-turbo libgif7 librsvg2-2 \
+    && apt-get install -y --no-install-recommends \
+        build-essential pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev \
+    && git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider /opt/bgutil-provider \
     && cd /opt/bgutil-provider/server \
     && npm install --no-audit --no-fund \
     && npx tsc \
-    && npm cache clean --force
+    && npm cache clean --force \
+    && apt-get purge -y --auto-remove \
+        build-essential pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev \
+    && rm -rf /var/lib/apt/lists/* /root/.cache/node-gyp
 ENV BGUTIL_SCRIPT_PATH=/opt/bgutil-provider/server/build/generate_once.js
 
 # Copy virtual env from builder
