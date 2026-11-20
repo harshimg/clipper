@@ -90,6 +90,8 @@ def youtube_non_video_reason(url):
         return None if parse_qs(parts.query).get("v") else "a watch page without a video id"
     if first in _SINGLE_VIDEO_PREFIXES:
         return None if len(segments) > 1 else f"a /{first} link without a video id"
+    if first.startswith("@") and segments[1:] == ["live"]:
+        return None  # the channel's current broadcast: one video
     if first.startswith("@") or first in _NOT_ONE_VIDEO:
         return _NOT_ONE_VIDEO.get(first, "a channel page, not a video")
     return ("a YouTube page that is not one video; open the video and paste "

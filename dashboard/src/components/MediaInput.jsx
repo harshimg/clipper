@@ -52,6 +52,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [targetClips, setTargetClips] = useState('');
     const [clipMinSeconds, setClipMinSeconds] = useState('');
     const [clipMaxSeconds, setClipMaxSeconds] = useState('');
+    // Link still live: how many of its last minutes to clip (blank = 30).
+    const [liveMinutes, setLiveMinutes] = useState('');
     // Auto-hook: burn the AI hook text into every clip. On by default; the
     // choice persists so turning it off sticks across sessions.
     const [autoHook, setAutoHook] = useState(() => {
@@ -132,6 +134,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
             layout,
             sourceStart: range ? Math.round(range.start) : null,
             sourceEnd: range ? Math.round(range.end) : null,
+            liveMinutes: mode === 'url' && liveMinutes ? liveMinutes : null,
         };
         try {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
@@ -358,6 +361,27 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 material doesn't hold them. Leave blank to let it decide.
                                 {plan === 'free' && ` The free plan makes the ${FREE_CLIPS_PER_VIDEO} to ${FREE_CLIPS_QUIET} best clips of each video, fewer while its queue is busy; plans get every clip, up to ${MAX_CLIPS_PER_VIDEO}.`}
                             </p>
+                            {mode === 'url' && (
+                                <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
+                                    <span className="text-xs text-ink2">
+                                        if the link is live right now, clip its last
+                                        <span className="block text-[11px] text-muted">
+                                            YouTube keeps up to 60 min; a finished stream is clipped whole.
+                                        </span>
+                                    </span>
+                                    <div className="flex items-center gap-2">
+                                        <input
+                                            type="number" min="1" max="60" step="1"
+                                            value={liveMinutes}
+                                            onChange={(e) => setLiveMinutes(e.target.value)}
+                                            placeholder="30"
+                                            className="input-field !w-20 text-xs py-1.5"
+                                            aria-label="minutes of a live stream to clip"
+                                        />
+                                        <span className="text-xs text-muted">min</span>
+                                    </div>
+                                </div>
+                            )}
                             <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
                                 <span className="text-xs text-ink2">vertical layout</span>
                                 <select

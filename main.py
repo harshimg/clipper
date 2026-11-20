@@ -868,6 +868,138 @@ def _content_block(error_text):
     return None
 
 
+# --- Live streams: clip the last N minutes ------------------------------------
+# A broadcast still running has no end to download: yt-dlp either records from
+# now on until it stops, or (live_from_start) from the start until it ends.
+# YouTube's live HLS playlists, though, list the last ~60 minutes of the stream
+# (720 segments of 5 s, measured on two channels on 20-nov-2026), so the last
+# LIVE_MINUTES of them are fetched at network speed: ffmpeg starts that many
+# segments back from the live edge and copies them into one mp4. YouTube lists
+# video and audio as separate playlists (both inputs, same start); a muxed
+# format is used alone. A playlist that holds less than a minute (no rewind
+# window: most non-YouTube lives) is recorded forward instead, in real time.
+LIVE_MINUTES_DEFAULT = 30.0
+LIVE_MINUTES_MAX = 60.0
+
+
+def live_minutes_requested():
+    try:
+        minutes = float(os.environ.get("LIVE_MINUTES", "") or LIVE_MINUTES_DEFAULT)
+    except ValueError:
+        minutes = LIVE_MINUTES_DEFAULT
+    return max(1.0, min(LIVE_MINUTES_MAX, minutes))
+
+
+def source_is_live(info):
+    return bool(info) and (info.get("live_status") == "is_live" or info.get("is_live") is True)
+
+
+def pick_live_hls_formats(formats, max_height=1080):
+    """(video, audio) HLS formats to capture: the best video at or under
+    ``max_height``, plus the best audio-only playlist when the video one has
+    no audio. (None, None) when there is no usable video playlist."""
+    hls = [f for f in formats or []
+           if "m3u8" in str(f.get("protocol") or "") and f.get("url")]
+    videos = [f for f in hls
+              if f.get("vcodec") != "none" and isinstance(f.get("height"), (int, float))
+              and f["height"] <= max_height]
+    if not videos:
+        return None, None
+    video = max(videos, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0))
+    if video.get("acodec") not in (None, "none"):
+        return video, None
+    audios = [f for f in hls if f.get("vcodec") == "none"]
+    if not audios:
+        return video, None
+    audio = max(audios, key=lambda f: (f.get("abr") or f.get("tbr") or 0,
+                                       str(f.get("format_id") or "")))
+    return video, audio
+
+
+def live_segments_for(playlist_text, seconds):
+    """How many segments from the end of a media playlist cover ``seconds``,
+    and how many seconds the whole playlist holds."""
+    durations = []
+    for line in str(playlist_text or "").splitlines():
+        if line.startswith("#EXTINF:"):
+            try:
+                durations.append(float(line[len("#EXTINF:"):].split(",")[0]))
+            except ValueError:
+                continue
+    window = sum(durations)
+    count, covered = 0, 0.0
+    for d in reversed(durations):
+        if covered >= seconds:
+            break
+        covered += d
+        count += 1
+    return count, window
+
+
+def _ffmpeg_header_args(headers):
+    lines = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items()
+                    if isinstance(k, str) and isinstance(v, str)
+                    and "\n" not in k + v and "\r" not in k + v)
+    return ["-headers", lines] if lines else []
+
+
+def capture_live_tail(info, output_dir, sanitized, proxy=None, max_height=1080):
+    """Save the last LIVE_MINUTES of a live stream as ``<sanitized>.mp4``.
+    Returns (path, seconds captured). Raises on failure."""
+    import urllib.request
+    video, audio = pick_live_hls_formats(info.get("formats"), max_height=max_height)
+    if video is None:
+        raise RuntimeError("This live stream offers no HLS format to capture.")
+    seconds = live_minutes_requested() * 60.0
+
+    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
+    opener = urllib.request.build_opener(*handlers)
+
+    def _headers(f):
+        return dict(f.get("http_headers") or info.get("http_headers") or {})
+
+    def _window(f):
+        req = urllib.request.Request(f["url"], headers=_headers(f))
+        with opener.open(req, timeout=30) as resp:
+            return live_segments_for(resp.read().decode("utf-8", "replace"), seconds)
+
+    segments, window = _window(video)
+    rewind = window >= 60.0
+    if rewind:
+        seconds = min(seconds, window)
+        print(f"🔴 Live stream: taking the last {seconds / 60:.0f} min "
+              f"(YouTube keeps the last {window / 60:.0f} min), {video.get('height')}p.")
+    else:
+        print(f"🔴 Live stream with no rewind window: recording the next "
+              f"{seconds / 60:.0f} min as it airs, {video.get('height')}p.")
+
+    def _input(f, count):
+        args = (["-http_proxy", proxy] if proxy else []) + _ffmpeg_header_args(_headers(f))
+        if rewind:
+            args += ["-live_start_index", str(-max(1, count))]
+        return args + ["-i", f["url"]]
+
+    out_path = os.path.join(output_dir, f"{sanitized}.mp4")
+    cmd = ["ffmpeg", "-y", "-nostdin", "-loglevel", "error"] + _input(video, segments)
+    maps = ["-map", "0:v:0"]
+    if audio is not None:
+        audio_segments = _window(audio)[0] if rewind else 0
+        cmd += _input(audio, audio_segments or segments)
+        maps += ["-map", "1:a:0"]
+    else:
+        maps += ["-map", "0:a:0?"]
+    cmd += maps + ["-t", f"{seconds:.0f}", "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                   "-movflags", "+faststart", out_path]
+    timeout = max(600.0, seconds * 1.5 + 300.0) if rewind else seconds + 600.0
+    started = time.time()
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError(f"Live capture failed: {(proc.stderr or '').strip()[-400:]}")
+    print(f"✅ Live capture saved in {time.time() - started:.0f}s "
+          f"({os.path.getsize(out_path) / 1e6:.0f} MB).")
+    return out_path, seconds
+
+
 def download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
                            cap_minutes=None, route_out=None, use_cache=False):
     """Download ``url`` with only public addresses resolvable (ssrf_guard): the
@@ -1107,12 +1239,29 @@ def _download_youtube_video(url, output_dir=".", on_audio=None, allow_paid=True,
         with (yt_session.request() if (cookies and cookies_path) else contextlib.nullcontext()):
             with yt_dlp.YoutubeDL(_base_opts(extractor_args, proxy, cookies)) as ydl:
                 info = ydl.extract_info(url, download=False, process=False)
+                if (info.get('_type') in ('url', 'url_transparent') and info.get('url')
+                        and info.get('ie_key') == 'Youtube'):
+                    # A channel's /live link points at its current broadcast:
+                    # extract that video, so a live one is seen as live.
+                    info = ydl.extract_info(info['url'], download=False, process=False)
         # Media URLs another program will fetch (ffmpeg on a ranged or HLS
         # download) resolve outside the Python guard: check them here. YouTube's
         # own CDN hosts are skipped (dozens of them, never internal).
         if not str(info.get('extractor_key') or info.get('ie_key') or '').lower().startswith('youtube'):
             import ssrf_guard
             ssrf_guard.assert_public_urls(info)
+        if source_is_live(info):
+            # Still on air: the last LIVE_MINUTES instead of the whole stream.
+            # Marked ranged, so the source cache never keeps it (a later job
+            # on the same live id wants a later stretch).
+            live_title = f"{info.get('title') or 'live'} live {time.strftime('%Y-%m-%d %H-%M')}"
+            sanitized = sanitize_filename(live_title)
+            _dl_bytes["ranged"] = True
+            path, _secs = capture_live_tail(
+                info, output_dir, sanitized, proxy=proxy,
+                max_height=720 if (_proxy and proxy == _proxy) else 1080)
+            _dl_bytes["total"] = os.path.getsize(path)
+            return sanitized
         sanitized = sanitize_filename(info.get('title', 'youtube_video'))
         # Only when the whole source is far bigger than what was paid for: a
         # ranged fetch goes through ffmpeg at ~1-2.5x realtime, while a native

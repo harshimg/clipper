@@ -1323,6 +1323,8 @@ function App() {
         // The stretch picked under the cost line (seconds); absent = whole video.
         source_start: data.sourceStart ?? null,
         source_end: data.sourceEnd ?? null,
+        // A link that is live right now: clip its last N minutes (server default 30).
+        live_minutes: data.liveMinutes || null,
       };
 
       if (data.type === 'url') {

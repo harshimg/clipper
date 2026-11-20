@@ -5987,6 +5987,7 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    live_minutes: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -6021,6 +6022,7 @@ async def process_endpoint(
         max_minutes = body.get("max_minutes")
         source_start = body.get("source_start")
         source_end = body.get("source_end")
+        live_minutes = body.get("live_minutes")
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -6164,6 +6166,11 @@ async def process_endpoint(
         env["CLIP_MAX_SECONDS"] = str(max_secs)
     if n_clips is not None or min_secs is not None or max_secs is not None:
         print(f"[gen-controls] job={job_id} clips={n_clips} band={min_secs}-{max_secs}")
+    # A link that is still live: how many of its last minutes to clip (main.py
+    # capture_live_tail; ignored for anything that is not on air).
+    live_mins = _gen_control(live_minutes, "live_minutes", 1, 60, integer=True)
+    if live_mins is not None:
+        env["LIVE_MINUTES"] = str(live_mins)
 
     # captions=false: the source already carries burned-in subtitles (or the
     # caller adds its own later), so skip the free auto-caption pass instead
